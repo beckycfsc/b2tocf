@@ -1,0 +1,29 @@
+// wrangler.jsonc
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "b2tocf-cluster",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-11-09",
+  "observability": {
+    "enabled": true
+  },
+  // 新增 KV 绑定
+  "kv_namespaces": [
+    {
+      "binding": "BUCKET_STATE_KV",
+      "id": "ad5050a5e9e44f5c8ebd8738df07b24c" 
+    }
+  ],
+  "vars": {
+    // 默认配置
+    "UPLOAD_STRATEGY": "balanced",
+    "MAX_BUCKET_SIZE_GB": "10",
+    "CACHE_TTL_METADATA": "3600",
+    "CACHE_TTL_LIST": "600",
+    "ENABLE_CONTENT_CACHE": "false",
+	"BUCKETS_CONFIG": "fbyigovk:004da538dbf31690000000001:K004Hhot2auADW14QiiM49AFHiiXL5c:s3.us-west-004.backblazeb2.com|lpaotgyf:0041d8ca9ddd8f80000000001:K004mQYJ2BiDutYN766aBV3ykiyqyjg:s3.us-west-004.backblazeb2.com",
+	"VIRTUAL_ACCESS_KEY_ID": "test"
+	// "VIRTUAL_SECRET_ACCESS_KEY": "test"
+	}
+  // 注意：敏感信息如 BUCKETS_CONFIG, VIRTUAL_ACCESS_KEY_ID 等通过 secret put 设置
+}
