@@ -169,3 +169,4 @@ dist
 .vscode/
 testcase
 prompt
+secrets.sh

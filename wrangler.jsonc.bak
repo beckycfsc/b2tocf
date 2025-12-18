@@ -16,11 +16,11 @@
   ],
   "vars": {
     // 默认配置
-	"CACHE_TTL_CONTENT": "86400",
+	  "CACHE_TTL_CONTENT": "86400",
     "UPLOAD_STRATEGY": "balanced",
     "MAX_BUCKET_SIZE_GB": "10",
-	"BUCKETS_CONFIG": "fbyigovk:004da538dbf31690000000001:K004Hhot2auADW14QiiM49AFHiiXL5c:s3.us-west-004.backblazeb2.com|lpaotgyf:0041d8ca9ddd8f80000000001:K004mQYJ2BiDutYN766aBV3ykiyqyjg:s3.us-west-004.backblazeb2.com",
-	"VIRTUAL_ACCESS_KEY_ID": "test"
+	  "BUCKETS_CONFIG": "fbyigovk:004da538dbf31690000000001:K004Hhot2auADW14QiiM49AFHiiXL5c:s3.us-west-004.backblazeb2.com|lpaotgyf:0041d8ca9ddd8f80000000001:K004mQYJ2BiDutYN766aBV3ykiyqyjg:s3.us-west-004.backblazeb2.com",
+	  "VIRTUAL_ACCESS_KEY_ID": "test"
 	// "VIRTUAL_SECRET_ACCESS_KEY": "test"
 	}
   // 注意：敏感信息如 BUCKETS_CONFIG, VIRTUAL_ACCESS_KEY_ID 等通过 secret put 设置

@@ -149,34 +149,52 @@ export class ClusterManager {
     return meta || null;
   }
 
-  // 列出文件 (支持 prefix)
-  async aggregateList(prefix: string = ''): Promise<any[]> {
+  // 列出文件 (支持 prefix 和 delimiter)
+  async aggregateList(prefix: string = '', delimiter?: string): Promise<{ contents: any[], commonPrefixes: string[] }> {
     const index = await this.loadIndex();
     
-    // 转换为数组并过滤
-    const files = Object.entries(index)
-      .filter(([key]) => key.startsWith(prefix))
-      .map(([key, meta]) => ({
-        Key: key,
-        LastModified: new Date(meta.lastModified),
-        ETag: meta.etag,
-        Size: meta.size,
-        StorageClass: 'STANDARD'
-      }));
+    const contents: any[] = [];
+    const commonPrefixes = new Set<string>();
 
-    // 排序 (按最后修改时间降序，模拟之前的逻辑)
-    files.sort((a, b) => b.LastModified.getTime() - a.LastModified.getTime());
+    for (const [key, meta] of Object.entries(index)) {
+      // 1. 检查前缀
+      if (!key.startsWith(prefix)) continue;
+
+      // 2. 处理分级逻辑
+      const relativePath = key.substring(prefix.length);
+      
+      if (delimiter && relativePath.includes(delimiter)) {
+        // 如果包含分隔符，提取 CommonPrefix (例如 "folder/")
+        const dIndex = relativePath.indexOf(delimiter);
+        const subFolder = prefix + relativePath.substring(0, dIndex + delimiter.length);
+        commonPrefixes.add(subFolder);
+      } else {
+        // 直接文件或未指定分隔符
+        contents.push({
+          Key: key,
+          LastModified: new Date(meta.lastModified),
+          ETag: meta.etag,
+          Size: meta.size,
+          StorageClass: 'STANDARD'
+        });
+      }
+    }
+
+    // 排序内容 (按最后修改时间降序)
+    contents.sort((a, b) => b.LastModified.getTime() - a.LastModified.getTime());
     
-    return files;
+    // 返回内容和去重后的前缀（排序后）
+    return {
+      contents,
+      commonPrefixes: Array.from(commonPrefixes).sort()
+    };
   }
 
   // 选桶策略 (基于索引实时计算使用量)
   async selectBucketForUpload(fileSize: number): Promise<string | null> {
     const index = await this.loadIndex();
-    // 修改点：支持浮点数解析
     const maxBytes = (parseFloat(this.env.MAX_BUCKET_SIZE_GB) || 10) * 1024 * 1024 * 1024;
     
-    // 1. 计算每个桶的当前用量
     const bucketUsage = new Map<string, number>();
     this.configs.forEach(c => bucketUsage.set(c.name, 0));
 
@@ -185,20 +203,15 @@ export class ClusterManager {
       bucketUsage.set(meta.bucket, current + meta.size);
     }
 
-    // 2. 策略选择
     const strategy = this.env.UPLOAD_STRATEGY || 'fill-first';
-    
-    // 转换为数组便于排序。Map 迭代保持插入顺序，故 fill-first 默认遵循 configs 顺序。
     const usageList = Array.from(bucketUsage.entries()).map(([name, usage]) => ({ name, usage }));
 
     if (strategy === 'balanced') {
-      // 找用量最少且能装下的
       usageList.sort((a, b) => a.usage - b.usage);
     }
 
     const candidate = usageList.find(u => u.usage + fileSize < maxBytes);
 
-    // 修改点：如果找不到可用桶，返回 null
     if (!candidate) {
       console.warn('All buckets full for the given file size');
       return null;
@@ -255,8 +268,6 @@ export class ClusterManager {
       throw new Error(`Upload failed: ${res.status} ${res.statusText} - ${errText}`);
     }
 
-    // === 同步更新 KV 索引 ===
-    // 注意：ETag 通常在 PUT 响应头中返回
     const etag = res.headers.get('ETag') || 'unknown';
     const size = length ? parseInt(length) : 0; 
     
@@ -280,7 +291,6 @@ export class ClusterManager {
     const url = this.buildUrl(bucketName, key);
     await client.fetch(url, { method: 'DELETE' });
 
-    // === 同步更新 KV 索引 ===
     const index = await this.loadIndex();
     if (index[key]) {
       delete index[key];
