@@ -114,19 +114,24 @@ export default {
 
       // === PUT OBJECT (UPLOAD) ===
       if (request.method === 'PUT') {
+        // 1. 检查 KV 中是否存在同名文件
         const existing = await cluster.locateFile(key);
         const size = parseInt(request.headers.get('Content-Length') || '0');
-        const targetBucket = await cluster.selectBucketForUpload(size);
 
+        // 2. 如果存在同名文件，先同步删除它以避免产生 Hide Marker
+        if (existing) {
+          // 传入 versionId 确保执行物理删除，updateKV 设为 false 避免中间态写入
+          await cluster.deleteObject(existing.bucket, key, existing.versionId, false);
+        }
+
+        // 3. 选桶并上传
+        const targetBucket = await cluster.selectBucketForUpload(size);
         if (!targetBucket) {
           return new Response('Insufficient Storage: No bucket has enough space for this file.', { status: 507 });
         }
 
+        // putObject 会自动记录 VersionID 并更新 KV 缓存
         const backendRes = await cluster.putObject(targetBucket, key, request.body, request.headers);
-
-        if (existing && existing.bucket !== targetBucket) {
-           ctx.waitUntil(cluster.deleteObject(existing.bucket, key));
-        }
 
         const respHeaders = new Headers();
         const etag = backendRes.headers.get('ETag');
@@ -139,7 +144,8 @@ export default {
       if (request.method === 'DELETE') {
         const existing = await cluster.locateFile(key);
         if (existing) {
-          await cluster.deleteObject(existing.bucket, key);
+          // 显式带上 VersionID 进行永久删除
+          await cluster.deleteObject(existing.bucket, key, existing.versionId);
         }
         return new Response(null, { status: 204 });
       }

@@ -9,6 +9,7 @@ interface FileMetadata {
   size: number;
   lastModified: number; // timestamp
   etag: string;
+  versionId?: string; // 新增：记录 S3/B2 的 Version ID
 }
 
 // 整个集群的文件索引 Map: filepath -> metadata
@@ -80,51 +81,56 @@ export class ClusterManager {
     // 并发处理每个桶
     const promises = this.configs.map(async (cfg) => {
       const client = this.clients.get(cfg.name)!;
-      let continuationToken: string | undefined = undefined;
+      let keyMarker: string | undefined = undefined;
+      let versionIdMarker: string | undefined = undefined;
       
       do {
         try {
-          const query = new URLSearchParams({ 'list-type': '2' }); // Use ListObjectsV2
-          if (continuationToken) {
-            query.set('continuation-token', continuationToken);
-          }
+          // 修改：使用 ?versions 接口以获取 VersionId
+          const query = new URLSearchParams({ 'versions': '' }); 
+          if (keyMarker) query.set('key-marker', keyMarker);
+          if (versionIdMarker) query.set('version-id-marker', versionIdMarker);
 
           const url = `${cfg.endpoint.replace(/\/$/, '')}/${cfg.name}/?${query.toString()}`;
           const res = await client.fetch(url, { method: 'GET' });
           if (!res.ok) {
-            console.error(`Failed to list bucket ${cfg.name}: ${res.status}`);
+            console.error(`Failed to list bucket versions ${cfg.name}: ${res.status}`);
             break;
           }
 
           const xmlText = await res.text();
           const parsed = this.xmlParser.parse(xmlText);
-          const result = parsed.ListBucketResult;
+          const result = parsed.ListVersionsResult;
 
-          if (result && result.Contents) {
-            const contents = Array.isArray(result.Contents) ? result.Contents : [result.Contents];
-            for (const item of contents) {
-              // 存入索引
-              newIndex[item.Key] = {
-                bucket: cfg.name,
-                size: parseInt(item.Size),
-                lastModified: new Date(item.LastModified).getTime(),
-                etag: item.ETag
-              };
+          if (result && result.Version) {
+            const versions = Array.isArray(result.Version) ? result.Version : [result.Version];
+            for (const v of versions) {
+              // 仅记录当前最新的非删除标记版本
+              if (v.IsLatest === 'true' || v.IsLatest === true) {
+                newIndex[v.Key] = {
+                  bucket: cfg.name,
+                  size: parseInt(v.Size),
+                  lastModified: new Date(v.LastModified).getTime(),
+                  etag: v.ETag,
+                  versionId: v.VersionId // 记录版本 ID
+                };
+              }
             }
           }
 
-          // 检查是否有下一页
+          // 检查分页
           if (result && result.IsTruncated === 'true') {
-            continuationToken = result.NextContinuationToken;
+            keyMarker = result.NextKeyMarker;
+            versionIdMarker = result.NextVersionIdMarker;
           } else {
-            continuationToken = undefined;
+            keyMarker = undefined;
           }
 
         } catch (e) {
           console.error(`Error listing bucket ${cfg.name}:`, e);
           break;
         }
-      } while (continuationToken);
+      } while (keyMarker);
     });
 
     await Promise.all(promises);
@@ -222,10 +228,15 @@ export class ClusterManager {
 
   // === 操作逻辑 (需要同步更新索引) ===
 
-  private buildUrl(bucketName: string, key: string): string {
+  private buildUrl(bucketName: string, key: string, versionId?: string): string {
     const cfg = this.configs.find(c => c.name === bucketName);
     if (!cfg) throw new Error(`Bucket ${bucketName} not found`);
-    return `${cfg.endpoint.replace(/\/$/, '')}/${bucketName}/${key.replace(/^\//, '')}`;
+    let url = `${cfg.endpoint.replace(/\/$/, '')}/${bucketName}/${key.replace(/^\//, '')}`;
+    // 如果提供了 versionId，附加到 URL 参数中以执行永久删除
+    if (versionId) {
+      url += `?versionId=${versionId}`;
+    }
+    return url;
   }
 
   // 下载
@@ -269,6 +280,8 @@ export class ClusterManager {
     }
 
     const etag = res.headers.get('ETag') || 'unknown';
+    // 捕获 B2 返回的新版本 ID
+    const newVersionId = res.headers.get('x-amz-version-id') || undefined;
     const size = length ? parseInt(length) : 0; 
     
     const index = await this.loadIndex();
@@ -276,25 +289,29 @@ export class ClusterManager {
       bucket: bucketName,
       size: size,
       lastModified: Date.now(),
-      etag: etag.replace(/"/g, '') // 去除引号
+      etag: etag.replace(/"/g, ''), // 去除引号
+      versionId: newVersionId // 存储版本 ID
     };
     await this.saveIndex(index);
     
     return res;
   }
 
-  // 删除
-  async deleteObject(bucketName: string, key: string) {
+  // 删除 (增加 updateKV 参数，默认为 true)
+  async deleteObject(bucketName: string, key: string, versionId?: string, updateKV = true) {
     const client = this.clients.get(bucketName);
     if (!client) return;
     
-    const url = this.buildUrl(bucketName, key);
+    // 带上 VersionID 以执行永久删除，否则在 B2 中只会产生隐藏标记
+    const url = this.buildUrl(bucketName, key, versionId);
     await client.fetch(url, { method: 'DELETE' });
 
     const index = await this.loadIndex();
     if (index[key]) {
       delete index[key];
-      await this.saveIndex(index);
+      if (updateKV) {
+        await this.saveIndex(index);
+      }
     }
   }
 }
