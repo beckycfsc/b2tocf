@@ -171,9 +171,10 @@ export class ClusterManager {
   }
 
   // 选桶策略 (基于索引实时计算使用量)
-  async selectBucketForUpload(fileSize: number): Promise<string> {
+  async selectBucketForUpload(fileSize: number): Promise<string | null> {
     const index = await this.loadIndex();
-    const maxBytes = (parseInt(this.env.MAX_BUCKET_SIZE_GB) || 10) * 1024 * 1024 * 1024;
+    // 修改点：支持浮点数解析
+    const maxBytes = (parseFloat(this.env.MAX_BUCKET_SIZE_GB) || 10) * 1024 * 1024 * 1024;
     
     // 1. 计算每个桶的当前用量
     const bucketUsage = new Map<string, number>();
@@ -187,23 +188,20 @@ export class ClusterManager {
     // 2. 策略选择
     const strategy = this.env.UPLOAD_STRATEGY || 'fill-first';
     
-    // 转换为数组便于排序
+    // 转换为数组便于排序。Map 迭代保持插入顺序，故 fill-first 默认遵循 configs 顺序。
     const usageList = Array.from(bucketUsage.entries()).map(([name, usage]) => ({ name, usage }));
 
     if (strategy === 'balanced') {
       // 找用量最少且能装下的
       usageList.sort((a, b) => a.usage - b.usage);
-    } else {
-      // fill-first: 这里的简单实现可以是按配置顺序，或者按当前用量从高到低(尽量填满)? 
-      // 通常 fill-first 是按配置顺序填。这里假设 configs 顺序即为优先顺序。
-      // 我们保留原先逻辑：直接找第一个能装下的。
     }
 
     const candidate = usageList.find(u => u.usage + fileSize < maxBytes);
 
+    // 修改点：如果找不到可用桶，返回 null
     if (!candidate) {
-      console.warn('All buckets full, defaulting to first bucket');
-      return this.configs[0].name;
+      console.warn('All buckets full for the given file size');
+      return null;
     }
     
     return candidate.name;

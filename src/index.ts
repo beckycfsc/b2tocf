@@ -32,7 +32,7 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
     // 处理 path: 如果是 /_cache 这种特殊路径需要特殊处理
-    // 普通文件 key 去掉开头的 /
+    // 普通文件 key 去掉开头的 /    
     const key = url.pathname.substring(1); 
     
     // 1. 鉴权
@@ -114,6 +114,11 @@ export default {
         
         // 3. 选桶 (基于 KV 索引计算容量)
         const targetBucket = await cluster.selectBucketForUpload(size);
+
+        // 修改点：如果找不到可用桶，返回 507 错误
+        if (!targetBucket) {
+          return new Response('Insufficient Storage: No bucket has enough space for this file.', { status: 507 });
+        }
 
         // 4. 上传 (内部会自动更新 KV 索引)
         const backendRes = await cluster.putObject(targetBucket, key, request.body, request.headers);
