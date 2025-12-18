@@ -5,7 +5,7 @@ import { AuthMiddleware } from './core/auth';
 import { Env } from './core/config';
 
 // 导出 Env 给 worker 识别
-// export { Env };
+export { Env };
 
 // 辅助：生成 S3 XML List 响应
 function generateXmlList(files: any[], bucketName: string): string {
