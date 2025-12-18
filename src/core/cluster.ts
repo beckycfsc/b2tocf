@@ -2,18 +2,31 @@
 import { AwsClient } from 'aws4fetch';
 import { XMLParser } from 'fast-xml-parser';
 import { Env, BucketConfig, parseBucketsConfig } from './config';
-import { UnifiedCache } from './cache';
+
+// 定义索引项结构
+interface FileMetadata {
+  bucket: string;
+  size: number;
+  lastModified: number; // timestamp
+  etag: string;
+}
+
+// 整个集群的文件索引 Map: filepath -> metadata
+type ClusterIndex = Record<string, FileMetadata>;
 
 export class ClusterManager {
-  private clients: Map<string, AwsClient>; // bucketName -> AwsClient
-  private configs: BucketConfig[]; // 保存配置以便获取 endpoint
+  private clients: Map<string, AwsClient>;
+  private configs: BucketConfig[];
   private env: Env;
-  private cache: UnifiedCache;
   private xmlParser: XMLParser;
+  
+  // 内存缓存一份 index，避免单次请求内多次读取 KV
+  private inMemoryIndex: ClusterIndex | null = null;
+  private readonly KV_KEY = 'CLUSTER_INDEX';
+  private readonly KV_TTL = 86400; // 1天
 
-  constructor(env: Env, cache: UnifiedCache) {
+  constructor(env: Env) {
     this.env = env;
-    this.cache = cache;
     this.configs = parseBucketsConfig(env.BUCKETS_CONFIG);
     this.clients = new Map();
     this.xmlParser = new XMLParser({
@@ -21,10 +34,7 @@ export class ClusterManager {
       attributeNamePrefix: "@_"
     });
 
-    // 初始化 aws4fetch 客户端
     this.configs.forEach(cfg => {
-      // 从 https://s3.region.backblazeb2.com 提取 region 和 service
-      // aws4fetch 会自动处理 host
       const client = new AwsClient({
         accessKeyId: cfg.accessKeyId,
         secretAccessKey: cfg.secretAccessKey,
@@ -35,79 +45,179 @@ export class ClusterManager {
     });
   }
 
-  // 获取配置信息（Endpoint等）
-  private getConfig(bucketName: string): BucketConfig | undefined {
-    return this.configs.find(c => c.name === bucketName);
-  }
+  // === 索引核心逻辑 ===
 
-  // 辅助：构建完整 URL
-  private buildUrl(bucketName: string, key: string, query?: URLSearchParams): string {
-    const cfg = this.getConfig(bucketName);
-    if (!cfg) throw new Error(`Configuration for bucket ${bucketName} not found`);
-    
-    // 确保 endpoint 不带末尾斜杠，key 不带开头斜杠
-    const baseUrl = cfg.endpoint.replace(/\/$/, '');
-    const cleanKey = key.replace(/^\//, '');
-    let url = `${baseUrl}/${bucketName}/${cleanKey}`;
-    if (query) {
-      url += `?${query.toString()}`;
-    }
-    return url;
-  }
+  // 加载索引 (内存 -> KV -> 重建)
+  private async loadIndex(forceRebuild = false): Promise<ClusterIndex> {
+    if (this.inMemoryIndex && !forceRebuild) return this.inMemoryIndex;
 
-  // 定位文件 (HEAD)
-  async locateFile(key: string): Promise<{ bucket: string, size: number, type: string, lastModified: Date } | null> {
-    // 1. 查缓存
-    const cachedBucket = await this.cache.getFileBucket(key);
-    if (cachedBucket && this.clients.has(cachedBucket)) {
-       // 即使命中缓存，为了获取最新元数据，建议还是 HEAD 一次，或者在此处信任缓存直接返回
-       // 这里为了演示完整性，如果命中缓存直接尝试 HEAD 确认
-       const res = await this.headObject(cachedBucket, key);
-       if (res) return res;
+    // 尝试从 KV 读取
+    if (!forceRebuild) {
+      const stored = await this.env.BUCKET_STATE_KV.get(this.KV_KEY, 'json');
+      if (stored) {
+        this.inMemoryIndex = stored as ClusterIndex;
+        return this.inMemoryIndex;
+      }
     }
 
-    // 2. 并发查询所有桶
-    const promises = this.configs.map(cfg => this.headObject(cfg.name, key));
-    const results = await Promise.all(promises);
+    // 如果 KV 没有或强制重建
+    console.log('Index missing or rebuild requested, rebuilding...');
+    return await this.rebuildIndex();
+  }
+
+  // 保存索引到 KV
+  private async saveIndex(index: ClusterIndex) {
+    this.inMemoryIndex = index;
+    await this.env.BUCKET_STATE_KV.put(this.KV_KEY, JSON.stringify(index), {
+      expirationTtl: this.KV_TTL
+    });
+  }
+
+  // 重建索引：遍历所有桶的所有文件
+  async rebuildIndex(): Promise<ClusterIndex> {
+    const newIndex: ClusterIndex = {};
     
-    // 过滤有效结果并取最新
-    const validResults = results.filter(r => r !== null).sort((a, b) => {
-        return (b!.lastModified.getTime() || 0) - (a!.lastModified.getTime() || 0);
+    // 并发处理每个桶
+    const promises = this.configs.map(async (cfg) => {
+      const client = this.clients.get(cfg.name)!;
+      let continuationToken: string | undefined = undefined;
+      
+      do {
+        try {
+          const query = new URLSearchParams({ 'list-type': '2' }); // Use ListObjectsV2
+          if (continuationToken) {
+            query.set('continuation-token', continuationToken);
+          }
+
+          const url = `${cfg.endpoint.replace(/\/$/, '')}/${cfg.name}/?${query.toString()}`;
+          const res = await client.fetch(url, { method: 'GET' });
+          if (!res.ok) {
+            console.error(`Failed to list bucket ${cfg.name}: ${res.status}`);
+            break;
+          }
+
+          const xmlText = await res.text();
+          const parsed = this.xmlParser.parse(xmlText);
+          const result = parsed.ListBucketResult;
+
+          if (result && result.Contents) {
+            const contents = Array.isArray(result.Contents) ? result.Contents : [result.Contents];
+            for (const item of contents) {
+              // 存入索引
+              newIndex[item.Key] = {
+                bucket: cfg.name,
+                size: parseInt(item.Size),
+                lastModified: new Date(item.LastModified).getTime(),
+                etag: item.ETag
+              };
+            }
+          }
+
+          // 检查是否有下一页
+          if (result && result.IsTruncated === 'true') {
+            continuationToken = result.NextContinuationToken;
+          } else {
+            continuationToken = undefined;
+          }
+
+        } catch (e) {
+          console.error(`Error listing bucket ${cfg.name}:`, e);
+          break;
+        }
+      } while (continuationToken);
     });
 
-    if (validResults.length > 0) {
-      const best = validResults[0]!;
-      await this.cache.setFileBucket(key, best.bucket);
-      return best;
-    }
-
-    return null;
+    await Promise.all(promises);
+    
+    // 保存并返回
+    await this.saveIndex(newIndex);
+    return newIndex;
   }
 
-  // 内部 HEAD 实现
-  private async headObject(bucketName: string, key: string) {
-    const client = this.clients.get(bucketName);
-    if (!client) return null;
-
-    try {
-      const url = this.buildUrl(bucketName, key);
-      const res = await client.fetch(url, { method: 'HEAD' });
-      
-      if (res.status === 200) {
-        return {
-          bucket: bucketName,
-          size: parseInt(res.headers.get('Content-Length') || '0'),
-          type: res.headers.get('Content-Type') || 'application/octet-stream',
-          lastModified: new Date(res.headers.get('Last-Modified') || new Date())
-        };
-      }
-    } catch (e) {
-      // ignore error
-    }
-    return null;
+  // 清除索引 (用于 API 手动清除)
+  async clearIndex() {
+    await this.env.BUCKET_STATE_KV.delete(this.KV_KEY);
+    this.inMemoryIndex = null;
   }
 
-  // 执行下载 (GET) - 返回 Response
+  // === 业务逻辑 (基于索引) ===
+
+  // 定位文件
+  async locateFile(key: string): Promise<FileMetadata | null> {
+    const index = await this.loadIndex();
+    const meta = index[key];
+    return meta || null;
+  }
+
+  // 列出文件 (支持 prefix)
+  async aggregateList(prefix: string = ''): Promise<any[]> {
+    const index = await this.loadIndex();
+    
+    // 转换为数组并过滤
+    const files = Object.entries(index)
+      .filter(([key]) => key.startsWith(prefix))
+      .map(([key, meta]) => ({
+        Key: key,
+        LastModified: new Date(meta.lastModified),
+        ETag: meta.etag,
+        Size: meta.size,
+        StorageClass: 'STANDARD'
+      }));
+
+    // 排序 (按最后修改时间降序，模拟之前的逻辑)
+    files.sort((a, b) => b.LastModified.getTime() - a.LastModified.getTime());
+    
+    return files;
+  }
+
+  // 选桶策略 (基于索引实时计算使用量)
+  async selectBucketForUpload(fileSize: number): Promise<string> {
+    const index = await this.loadIndex();
+    const maxBytes = (parseInt(this.env.MAX_BUCKET_SIZE_GB) || 10) * 1024 * 1024 * 1024;
+    
+    // 1. 计算每个桶的当前用量
+    const bucketUsage = new Map<string, number>();
+    this.configs.forEach(c => bucketUsage.set(c.name, 0));
+
+    for (const meta of Object.values(index)) {
+      const current = bucketUsage.get(meta.bucket) || 0;
+      bucketUsage.set(meta.bucket, current + meta.size);
+    }
+
+    // 2. 策略选择
+    const strategy = this.env.UPLOAD_STRATEGY || 'fill-first';
+    
+    // 转换为数组便于排序
+    const usageList = Array.from(bucketUsage.entries()).map(([name, usage]) => ({ name, usage }));
+
+    if (strategy === 'balanced') {
+      // 找用量最少且能装下的
+      usageList.sort((a, b) => a.usage - b.usage);
+    } else {
+      // fill-first: 这里的简单实现可以是按配置顺序，或者按当前用量从高到低(尽量填满)? 
+      // 通常 fill-first 是按配置顺序填。这里假设 configs 顺序即为优先顺序。
+      // 我们保留原先逻辑：直接找第一个能装下的。
+    }
+
+    const candidate = usageList.find(u => u.usage + fileSize < maxBytes);
+
+    if (!candidate) {
+      console.warn('All buckets full, defaulting to first bucket');
+      return this.configs[0].name;
+    }
+    
+    return candidate.name;
+  }
+
+  // === 操作逻辑 (需要同步更新索引) ===
+
+  private buildUrl(bucketName: string, key: string): string {
+    const cfg = this.configs.find(c => c.name === bucketName);
+    if (!cfg) throw new Error(`Bucket ${bucketName} not found`);
+    return `${cfg.endpoint.replace(/\/$/, '')}/${bucketName}/${key.replace(/^\//, '')}`;
+  }
+
+  // 下载
   async getObject(bucketName: string, key: string, range?: string): Promise<Response> {
     const client = this.clients.get(bucketName);
     if (!client) throw new Error('Bucket client not found');
@@ -118,8 +228,6 @@ export class ClusterManager {
 
     const res = await client.fetch(url, { method: 'GET', headers });
     
-    // 重新构建 Response 以确保 header干净，或者直接透传
-    // aws4fetch 返回的是标准 Response
     return new Response(res.body, {
       status: res.status,
       statusText: res.statusText,
@@ -127,19 +235,17 @@ export class ClusterManager {
     });
   }
 
-  // 执行上传 (PUT)
+  // 上传
   async putObject(bucketName: string, key: string, body: ReadableStream | null, headers: Headers) {
     const client = this.clients.get(bucketName);
     if (!client) throw new Error('Bucket client not found');
 
     const url = this.buildUrl(bucketName, key);
-    
-    // 提取关键头信息
     const putHeaders: Record<string, string> = {};
     if (headers.get('Content-Type')) putHeaders['Content-Type'] = headers.get('Content-Type')!;
-    if (headers.get('Content-Length')) putHeaders['Content-Length'] = headers.get('Content-Length')!;
-    
-    // aws4fetch 会自动处理签名
+    const length = headers.get('Content-Length');
+    if (length) putHeaders['Content-Length'] = length;
+
     const res = await client.fetch(url, {
       method: 'PUT',
       body: body,
@@ -150,108 +256,37 @@ export class ClusterManager {
       const errText = await res.text();
       throw new Error(`Upload failed: ${res.status} ${res.statusText} - ${errText}`);
     }
+
+    // === 同步更新 KV 索引 ===
+    // 注意：ETag 通常在 PUT 响应头中返回
+    const etag = res.headers.get('ETag') || 'unknown';
+    const size = length ? parseInt(length) : 0; 
+    
+    const index = await this.loadIndex();
+    index[key] = {
+      bucket: bucketName,
+      size: size,
+      lastModified: Date.now(),
+      etag: etag.replace(/"/g, '') // 去除引号
+    };
+    await this.saveIndex(index);
     
     return res;
   }
 
-  // 执行删除 (DELETE)
+  // 删除
   async deleteObject(bucketName: string, key: string) {
     const client = this.clients.get(bucketName);
     if (!client) return;
+    
     const url = this.buildUrl(bucketName, key);
     await client.fetch(url, { method: 'DELETE' });
-  }
 
-  // 选桶策略
-  async selectBucketForUpload(fileSize: number): Promise<string> {
-    const maxBytes = (parseInt(this.env.MAX_BUCKET_SIZE_GB) || 10) * 1024 * 1024 * 1024;
-    const strategy = this.env.UPLOAD_STRATEGY || 'fill-first';
-
-    const usages: { name: string, usage: number }[] = [];
-    for (const cfg of this.configs) {
-      const val = await this.env.BUCKET_STATE_KV.get(`usage:${cfg.name}`);
-      usages.push({ name: cfg.name, usage: val ? parseInt(val) : 0 });
+    // === 同步更新 KV 索引 ===
+    const index = await this.loadIndex();
+    if (index[key]) {
+      delete index[key];
+      await this.saveIndex(index);
     }
-
-    let selected: string | null = null;
-
-    if (strategy === 'balanced') {
-      usages.sort((a, b) => a.usage - b.usage);
-      const candidate = usages.find(u => u.usage + fileSize < maxBytes);
-      selected = candidate ? candidate.name : null;
-    } else {
-      const candidate = usages.find(u => u.usage + fileSize < maxBytes);
-      selected = candidate ? candidate.name : null;
-    }
-
-    if (!selected) {
-        // 如果都满了或者没有数据，降级回第一个配置的桶
-        console.warn('All buckets full or KV error, defaulting to first bucket');
-        return this.configs[0].name;
-    }
-    return selected;
-  }
-
-  async incrementUsage(bucketName: string, bytes: number) {
-    const key = `usage:${bucketName}`;
-    const current = await this.env.BUCKET_STATE_KV.get(key);
-    const newVal = (current ? parseInt(current) : 0) + bytes;
-    await this.env.BUCKET_STATE_KV.put(key, newVal.toString());
-  }
-
-  // 聚合 List
-  async aggregateList(prefix: string = ''): Promise<any[]> {
-    const promises = this.configs.map(async (cfg) => {
-      const client = this.clients.get(cfg.name)!;
-      try {
-        const query = new URLSearchParams({ prefix });
-        // S3 ListObjectsV2
-        query.set('list-type', '2'); 
-        const url = this.buildUrl(cfg.name, '', query);
-        
-        const res = await client.fetch(url, { method: 'GET' });
-        if (!res.ok) throw new Error(res.statusText);
-        
-        const xmlText = await res.text();
-        const parsed = this.xmlParser.parse(xmlText);
-        
-        // 处理 fast-xml-parser 的输出结构
-        // ListBucketResult.Contents 可能是数组或单个对象
-        const result = parsed.ListBucketResult;
-        if (!result || !result.Contents) return [];
-        
-        const contents = Array.isArray(result.Contents) ? result.Contents : [result.Contents];
-        
-        return contents.map((item: any) => ({
-          Key: item.Key,
-          LastModified: new Date(item.LastModified),
-          ETag: item.ETag,
-          Size: parseInt(item.Size),
-          _bucket: cfg.name
-        }));
-
-      } catch (e) {
-        console.error(`List failed for ${cfg.name}`, e);
-        return [];
-      }
-    });
-
-    const results = await Promise.all(promises);
-    const allFiles = results.flat();
-
-    const fileMap = new Map<string, any>();
-    allFiles.forEach(file => {
-      const key = file.Key!;
-      if (!fileMap.has(key)) {
-        fileMap.set(key, file);
-      } else {
-        const existing = fileMap.get(key);
-        if (file.LastModified > existing.LastModified) {
-          fileMap.set(key, file);
-        }
-      }
-    });
-
-    return Array.from(fileMap.values());
   }
 }

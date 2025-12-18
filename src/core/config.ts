@@ -11,9 +11,8 @@ export interface Env {
   MAX_BUCKET_SIZE_GB: string; // 默认 10
   
   // 缓存 TTL (秒)
-  CACHE_TTL_METADATA: string; // 默认 3600 (路径->桶映射)
-  CACHE_TTL_LIST: string;     // 默认 600 (文件列表)
-  ENABLE_CONTENT_CACHE: string; // "true" / "false"
+  // 0 表示不启用 CDN 缓存，只通过 Worker 转发
+  CACHE_TTL_CONTENT: string; 
 
   // Bindings
   BUCKET_STATE_KV: KVNamespace;

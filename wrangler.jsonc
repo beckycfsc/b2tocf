@@ -16,11 +16,9 @@
   ],
   "vars": {
     // 默认配置
+	"CACHE_TTL_CONTENT": "86400",
     "UPLOAD_STRATEGY": "balanced",
     "MAX_BUCKET_SIZE_GB": "10",
-    "CACHE_TTL_METADATA": "3600",
-    "CACHE_TTL_LIST": "600",
-    "ENABLE_CONTENT_CACHE": "false",
 	"BUCKETS_CONFIG": "fbyigovk:004da538dbf31690000000001:K004Hhot2auADW14QiiM49AFHiiXL5c:s3.us-west-004.backblazeb2.com|lpaotgyf:0041d8ca9ddd8f80000000001:K004mQYJ2BiDutYN766aBV3ykiyqyjg:s3.us-west-004.backblazeb2.com",
 	"VIRTUAL_ACCESS_KEY_ID": "test"
 	// "VIRTUAL_SECRET_ACCESS_KEY": "test"
