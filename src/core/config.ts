@@ -6,6 +6,9 @@ export interface Env {
   VIRTUAL_ACCESS_KEY_ID: string;
   VIRTUAL_SECRET_ACCESS_KEY: string;
   
+  // S3 兼容性配置
+  S3_VIRTUAL_BUCKET?: string; // 虚拟桶名称
+
   // 策略与限制
   UPLOAD_STRATEGY: 'fill-first' | 'balanced'; // 默认 fill-first
   MAX_BUCKET_SIZE_GB: string; // 默认 10

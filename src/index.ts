@@ -6,6 +6,25 @@ import { Env } from './core/config';
 
 // export { Env };
 
+// 鲁棒解码函数：处理单次或多次 URL 编码
+function safeDecode(str: string): string {
+  try {
+    let result = str;
+    const first = decodeURIComponent(result);
+    // 如果解码后仍包含 %，尝试再次解码（应对某些平台的双重编码）
+    if (first.includes('%')) {
+      try {
+        return decodeURIComponent(first);
+      } catch {
+        return first;
+      }
+    }
+    return first;
+  } catch {
+    return str;
+  }
+}
+
 // 辅助：生成 S3 XML List 响应
 function generateXmlList(files: any[], commonPrefixes: string[], bucketName: string, prefix: string, delimiter: string): string {
   const contents = files.map(f => `
@@ -38,9 +57,20 @@ function generateXmlList(files: any[], commonPrefixes: string[], bucketName: str
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     const url = new URL(request.url);
-    const key = url.pathname.substring(1); 
     
-    // 1. 鉴权
+    // 1. 提取路径中的 Key
+    let path = url.pathname.substring(1); 
+    const virtualBucket = env.S3_VIRTUAL_BUCKET || 'virtual-bucket';
+    
+    if (path.startsWith(virtualBucket + '/')) {
+      path = path.substring(virtualBucket.length + 1);
+    } else if (path === virtualBucket) {
+      path = '';
+    }
+
+    const key = safeDecode(path);
+    
+    // 2. 鉴权
     const auth = new AuthMiddleware(env);
     const isAuth = await auth.verify(request);
     
@@ -60,12 +90,21 @@ export default {
 
       // === LIST OBJECTS (GET / or GET /?list-type=2) ===
       if (request.method === 'GET' && (key === '' || url.searchParams.has('list-type') || url.searchParams.has('prefix'))) {
-        const prefix = url.searchParams.get('prefix') || '';
-        const delimiter = url.searchParams.get('delimiter') || '';
+        // 解码参数中的 prefix 和 delimiter
+        const paramPrefix = safeDecode(url.searchParams.get('prefix') || '');
+        const delimiter = safeDecode(url.searchParams.get('delimiter') || '');
 
-        // 直接从 KV 索引聚合 (按需进行分级折叠)
-        const { contents, commonPrefixes } = await cluster.aggregateList(prefix, delimiter || undefined);
-        const xml = generateXmlList(contents, commonPrefixes, 'virtual-bucket', prefix, delimiter);
+        // 合并路径中的 key 和 参数中的 prefix (应对 Path-style 下文件夹在路径里的情况)
+        let effectivePrefix = paramPrefix;
+        if (key && key !== '') {
+          // 如果 key 不为空且不以 / 结尾，补充 /
+          const base = key.endsWith('/') ? key : key + '/';
+          effectivePrefix = base + paramPrefix;
+        }
+
+        // 直接从 KV 索引聚合
+        const { contents, commonPrefixes } = await cluster.aggregateList(effectivePrefix, delimiter || undefined);
+        const xml = generateXmlList(contents, commonPrefixes, virtualBucket, effectivePrefix, delimiter);
         
         return new Response(xml, { headers: { 'Content-Type': 'application/xml' } });
       }
