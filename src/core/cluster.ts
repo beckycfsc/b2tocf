@@ -196,6 +196,23 @@ export class ClusterManager {
     };
   }
 
+  // 获取各桶占用大小
+  async getBucketsUsage(): Promise<Record<string, number>> {
+    const index = await this.loadIndex();
+    const usage: Record<string, number> = {};
+    
+    // 初始化
+    this.configs.forEach(c => usage[c.name] = 0);
+
+    // 统计
+    for (const meta of Object.values(index)) {
+      if (usage.hasOwnProperty(meta.bucket)) {
+        usage[meta.bucket] += meta.size;
+      }
+    }
+    return usage;
+  }
+
   // 选桶策略 (基于索引实时计算使用量)
   async selectBucketForUpload(fileSize: number): Promise<string | null> {
     const index = await this.loadIndex();

@@ -88,6 +88,24 @@ export default {
         return new Response('Cache Cleared', { status: 200 });
       }
 
+      // === 新增 API: 选择桶 ===
+      if (request.method === 'GET' && url.pathname === '/select_bucket') {
+        const sizeParam = url.searchParams.get('size');
+        const size = sizeParam ? parseInt(sizeParam) : 0;
+        const bucket = await cluster.selectBucketForUpload(size);
+        return new Response(JSON.stringify({ bucket }), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
+      // === 新增 API: 桶占用大小 ===
+      if (request.method === 'GET' && url.pathname === '/bucket_size') {
+        const usage = await cluster.getBucketsUsage();
+        return new Response(JSON.stringify(usage), {
+          headers: { 'Content-Type': 'application/json' }
+        });
+      }
+
       // === LIST OBJECTS (GET / or GET /?list-type=2) ===
       if (request.method === 'GET' && (key === '' || url.searchParams.has('list-type') || url.searchParams.has('prefix'))) {
         // 解码参数中的 prefix 和 delimiter
