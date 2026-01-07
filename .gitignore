@@ -167,6 +167,7 @@ dist
 .wrangler/
 
 .vscode/
-testcase
+testcase*
 prompt
 secrets.sh
+getbucketconfig.py

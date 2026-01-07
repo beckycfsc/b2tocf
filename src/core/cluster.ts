@@ -28,7 +28,37 @@ export class ClusterManager {
 
   constructor(env: Env) {
     this.env = env;
-    this.configs = parseBucketsConfig(env.BUCKETS_CONFIG);
+    
+    // 1. 收集所有配置字符串片段
+    const configSegments: string[] = [];
+
+    // 无论是否设置了 BUCKETS_CONFIG，都先把它作为默认基础部分
+    if (env.BUCKETS_CONFIG) {
+      configSegments.push(env.BUCKETS_CONFIG);
+    }
+
+    // 2. 读取 BUCKETS_CONFIG_PART_LIST 并获取对应变量的值
+    if (env.BUCKETS_CONFIG_PART_LIST) {
+      const partNames = env.BUCKETS_CONFIG_PART_LIST.split(',')
+        .map(name => name.trim())
+        .filter(name => name.length > 0);
+
+      for (const name of partNames) {
+        const partValue = env[name]; // 动态读取环境变量
+        if (partValue && typeof partValue === 'string') {
+          configSegments.push(partValue);
+        }
+      }
+    }
+
+    // 3. 拼接所有片段并解析
+    const combinedConfigStr = configSegments.join('|');
+    const allConfigs = parseBucketsConfig(combinedConfigStr);
+
+    // 4. 按 bucket_name 去重且保持顺序
+    this.configs = this.deduplicateConfigs(allConfigs);
+
+    // 5. 初始化 S3 客户端
     this.clients = new Map();
     this.xmlParser = new XMLParser({
       ignoreAttributes: false,
@@ -43,6 +73,20 @@ export class ClusterManager {
         region: cfg.region,
       });
       this.clients.set(cfg.name, client);
+    });
+  }
+
+  /**
+   * 辅助方法：按桶名去重并保留首次出现的顺序
+   */
+  private deduplicateConfigs(configs: BucketConfig[]): BucketConfig[] {
+    const seenNames = new Set<string>();
+    return configs.filter(cfg => {
+      if (seenNames.has(cfg.name)) {
+        return false;
+      }
+      seenNames.add(cfg.name);
+      return true;
     });
   }
 

@@ -3,6 +3,7 @@
 export interface Env {
   // 基础配置
   BUCKETS_CONFIG: string; // 格式: name:id:key:endpoint|...
+  BUCKETS_CONFIG_PART_LIST?: string;
   VIRTUAL_ACCESS_KEY_ID: string;
   VIRTUAL_SECRET_ACCESS_KEY: string;
   
@@ -18,6 +19,7 @@ export interface Env {
   CACHE_TTL_CONTENT: string; 
 
   // Bindings
+  [key: string]: any;
   BUCKET_STATE_KV: KVNamespace;
 }
 
